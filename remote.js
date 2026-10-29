@@ -1,15 +1,29 @@
 /**
- * AlveeTV Remote Controller
- * Zero-dependency client communicating directly with AlveeTV on port 8080.
+ * AlveeTV Web Remote & Hardware H.264 Live Screen Client
+ * Zero-dependency, ultra low-latency WebCodecs stream + input dispatcher.
  */
 
 // State
-let tvIp = localStorage.getItem('alveetv_ip') || '192.168.0.54';
 const PORT = 8080;
+let tvIp = localStorage.getItem('alveetv_ip') || 
+  (location.hostname && location.hostname !== 'localhost' && !location.hostname.includes('vercel.app') 
+    ? location.hostname 
+    : '192.168.0.54');
+
 let hapticEnabled = localStorage.getItem('alveetv_haptic') !== 'false';
 let isConnected = false;
 let pingTimer = null;
 let currentMode = 'dpad';
+
+// Streaming State
+let isStreaming = false;
+let streamAbortController = null;
+let videoDecoder = null;
+let spsData = null;
+let ppsData = null;
+let frameCount = 0;
+let fpsTimer = null;
+let timestampIndex = 0;
 
 // Elements
 const statusBadge = document.getElementById('statusBadge');
@@ -27,31 +41,68 @@ const tabDpad = document.getElementById('tabDpad');
 const tabTrackpad = document.getElementById('tabTrackpad');
 const touchpad = document.getElementById('touchpad');
 const scrollStrip = document.getElementById('scrollStrip');
+const liveCanvas = document.getElementById('liveCanvas');
+const btnLiveScreen = document.getElementById('btnLiveScreen');
+const screenSection = document.getElementById('screenSection');
+const streamPlaceholder = document.getElementById('streamPlaceholder');
+const tvPowerLed = document.getElementById('tvPowerLed');
+const fpsBadge = document.getElementById('fpsBadge');
+const tapRipple = document.getElementById('tapRipple');
+const httpsWarning = document.getElementById('httpsWarning');
+const localTvLink = document.getElementById('localTvLink');
+const modalDirectLink = document.getElementById('modalDirectLink');
 
 // Initialize
 window.addEventListener('DOMContentLoaded', () => {
   if (tvIpInput) tvIpInput.value = tvIp;
   if (hapticToggle) hapticToggle.checked = hapticEnabled;
 
+  updateDirectLinks();
+  checkHttpsEnvironment();
   initTouchpad();
   initScrollStrip();
+  initDesktopShortcuts();
   checkConnection();
+
+  // On mobile devices, hide screen monitor by default until user taps "Live Screen"
+  if (window.innerWidth < 960 && screenSection) {
+    screenSection.classList.add('collapsed');
+  }
 
   // Periodic health check
   pingTimer = setInterval(checkConnection, 5000);
 
-  // Register service worker for PWA offline support
+  // Register service worker for PWA support
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 });
 
+// Update TV Direct Link URLs
+function updateDirectLinks() {
+  const directUrl = `http://${tvIp}:${PORT}`;
+  if (localTvLink) localTvLink.href = directUrl;
+  if (modalDirectLink) {
+    modalDirectLink.href = directUrl;
+    modalDirectLink.textContent = directUrl;
+  }
+}
+
+// Detect Mixed Content issue on HTTPS / Vercel
+function checkHttpsEnvironment() {
+  if (window.location.protocol === 'https:') {
+    if (httpsWarning) httpsWarning.classList.remove('hidden');
+  }
+}
+
+function dismissBanner() {
+  if (httpsWarning) httpsWarning.classList.add('hidden');
+}
+
 // Vibration feedback
 function vibrate(ms = 15) {
   if (hapticEnabled && 'vibrate' in navigator) {
-    try {
-      navigator.vibrate(ms);
-    } catch (e) {}
+    try { navigator.vibrate(ms); } catch (e) {}
   }
 }
 
@@ -70,7 +121,6 @@ async function checkConnection() {
     });
     clearTimeout(timeoutId);
     if (res.ok) {
-      const data = await res.json();
       const latency = Math.round(performance.now() - t0);
       setConnectedState(true, latency);
       return true;
@@ -89,10 +139,12 @@ function setConnectedState(online, latency = 0) {
     statusDot.className = 'status-dot connected';
     statusText.textContent = tvIp;
     latencyBadge.textContent = `${latency}ms`;
+    if (tvPowerLed && isStreaming) tvPowerLed.className = 'power-led active';
   } else {
     statusDot.className = 'status-dot disconnected';
     statusText.textContent = 'Disconnected';
     latencyBadge.textContent = '';
+    if (tvPowerLed) tvPowerLed.className = 'power-led';
   }
 }
 
@@ -110,18 +162,293 @@ async function sendKey(code) {
       signal: controller.signal
     });
     clearTimeout(timeout);
-    if (res.ok) {
-      if (!isConnected) setConnectedState(true);
-    }
+    if (res.ok && !isConnected) setConnectedState(true);
   } catch (e) {
-    // Fallback to GET
-    try {
-      fetch(url, { method: 'GET', mode: 'no-cors' });
-    } catch (err) {}
+    try { fetch(url, { method: 'GET', mode: 'no-cors' }); } catch (err) {}
   }
 }
 
-// Mouse Touchpad Implementation
+/* ========================================================================== */
+/* METHOD A: HARDWARE H.264 WEB STREAMING ENGINE (WebCodecs API)               */
+/* ========================================================================== */
+
+async function toggleLiveScreen() {
+  if (isStreaming) {
+    stopStream();
+  } else {
+    startStream();
+  }
+}
+
+async function startStream() {
+  if (isStreaming) return;
+  isStreaming = true;
+
+  if (screenSection) screenSection.classList.remove('collapsed');
+  if (btnLiveScreen) btnLiveScreen.classList.add('active');
+  if (streamPlaceholder) streamPlaceholder.classList.add('hidden');
+  if (tvPowerLed) tvPowerLed.className = 'power-led active';
+
+  frameCount = 0;
+  fpsTimer = setInterval(() => {
+    if (fpsBadge) fpsBadge.textContent = `${frameCount} FPS`;
+    frameCount = 0;
+  }, 1000);
+
+  const ctx = liveCanvas.getContext('2d');
+  timestampIndex = 0;
+
+  // Check if WebCodecs is supported
+  const hasWebCodecs = typeof VideoDecoder !== 'undefined';
+  if (!hasWebCodecs) {
+    console.warn('WebCodecs not supported in this browser; starting snapshot mode.');
+    runSnapshotFallback();
+    return;
+  }
+
+  streamAbortController = new AbortController();
+  const streamUrl = `http://${tvIp}:${PORT}/stream.h264`;
+
+  try {
+    videoDecoder = new VideoDecoder({
+      output: (frame) => {
+        ctx.drawImage(frame, 0, 0, liveCanvas.width, liveCanvas.height);
+        frame.close();
+        frameCount++;
+      },
+      error: (e) => {
+        console.error('VideoDecoder error:', e);
+      }
+    });
+
+    const response = await fetch(streamUrl, {
+      signal: streamAbortController.signal,
+      mode: 'cors'
+    });
+
+    if (!response.body) throw new Error('No readable stream body');
+
+    const reader = response.body.getReader();
+    let buffer = new Uint8Array(0);
+
+    while (isStreaming) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      // Append new chunk to buffer
+      const newBuf = new Uint8Array(buffer.length + value.length);
+      newBuf.set(buffer, 0);
+      newBuf.set(value, buffer.length);
+      buffer = newBuf;
+
+      // Parse Annex B NAL units (0x00 0x00 0x00 0x01 or 0x00 0x00 0x01)
+      let nalStart = -1;
+      let i = 0;
+
+      while (i < buffer.length - 4) {
+        if (buffer[i] === 0 && buffer[i+1] === 0 && (buffer[i+2] === 1 || (buffer[i+2] === 0 && buffer[i+3] === 1))) {
+          const prefixLen = buffer[i+2] === 1 ? 3 : 4;
+          if (nalStart >= 0) {
+            const nalData = buffer.slice(nalStart, i);
+            processNalUnit(nalData);
+          }
+          nalStart = i + prefixLen;
+          i += prefixLen;
+        } else {
+          i++;
+        }
+      }
+
+      // Retain remainder
+      if (nalStart >= 0) {
+        buffer = buffer.slice(nalStart);
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.warn('H.264 stream disconnected:', err);
+    }
+    stopStream();
+  }
+}
+
+function processNalUnit(nal) {
+  if (!nal || nal.length === 0 || !videoDecoder) return;
+
+  const nalType = nal[0] & 0x1F;
+
+  // SPS (Type 7)
+  if (nalType === 7) {
+    spsData = nal;
+    return;
+  }
+
+  // PPS (Type 8)
+  if (nalType === 8) {
+    ppsData = nal;
+    if (spsData && videoDecoder.state === 'unconfigured') {
+      try {
+        videoDecoder.configure({
+          codec: 'avc1.42001f', // Baseline 720p
+          optimizeForLatency: true
+        });
+      } catch (e) {
+        console.error('Decoder configure error:', e);
+      }
+    }
+    return;
+  }
+
+  // IDR Keyframe (Type 5) or Delta frame (Type 1)
+  if (videoDecoder.state === 'configured') {
+    const isKey = (nalType === 5);
+    try {
+      const chunk = new EncodedVideoChunk({
+        type: isKey ? 'key' : 'delta',
+        timestamp: (timestampIndex++) * 16666, // ~60fps ticks
+        data: nal
+      });
+      videoDecoder.decode(chunk);
+    } catch (e) {}
+  }
+}
+
+function stopStream() {
+  isStreaming = false;
+  if (streamAbortController) {
+    streamAbortController.abort();
+    streamAbortController = null;
+  }
+  if (videoDecoder) {
+    try { videoDecoder.close(); } catch (e) {}
+    videoDecoder = null;
+  }
+  if (fpsTimer) {
+    clearInterval(fpsTimer);
+    fpsTimer = null;
+  }
+  if (fpsBadge) fpsBadge.textContent = '0 FPS';
+  if (btnLiveScreen) btnLiveScreen.classList.remove('active');
+  if (streamPlaceholder) streamPlaceholder.classList.remove('hidden');
+  if (tvPowerLed) tvPowerLed.className = 'power-led';
+}
+
+function restartStream() {
+  stopStream();
+  setTimeout(startStream, 300);
+}
+
+// Fallback snapshot loop
+async function runSnapshotFallback() {
+  const ctx = liveCanvas.getContext('2d');
+  const img = new Image();
+  img.onload = () => {
+    ctx.drawImage(img, 0, 0, liveCanvas.width, liveCanvas.height);
+    frameCount++;
+    if (isStreaming) {
+      setTimeout(() => { img.src = `http://${tvIp}:${PORT}/ping?t=${Date.now()}`; }, 100);
+    }
+  };
+}
+
+// Tap directly on TV screen canvas
+function handleScreenTap(e) {
+  const rect = liveCanvas.getBoundingClientRect();
+  const clickX = e.clientX - rect.left;
+  const clickY = e.clientY - rect.top;
+
+  const tvX = Math.round((clickX / rect.width) * 1280);
+  const tvY = Math.round((clickY / rect.height) * 720);
+
+  // Animate ripple
+  if (tapRipple) {
+    tapRipple.style.left = `${clickX}px`;
+    tapRipple.style.top = `${clickY}px`;
+    tapRipple.classList.remove('animate');
+    void tapRipple.offsetWidth; // trigger reflow
+    tapRipple.classList.add('animate');
+  }
+
+  vibrate(20);
+  const url = `http://${tvIp}:${PORT}/tap?x=${tvX}&y=${tvY}`;
+  fetch(url, { method: 'POST', mode: 'cors' }).catch(() => {});
+}
+
+function toggleFullscreen() {
+  const container = document.getElementById('canvasContainer');
+  if (!document.fullscreenElement) {
+    if (container.requestFullscreen) container.requestFullscreen();
+    else if (container.webkitRequestFullscreen) container.webkitRequestFullscreen();
+  } else {
+    if (document.exitFullscreen) document.exitFullscreen();
+  }
+}
+
+/* ========================================================================== */
+/* DESKTOP KEYBOARD SHORTCUTS                                                  */
+/* ========================================================================== */
+
+function initDesktopShortcuts() {
+  window.addEventListener('keydown', (e) => {
+    // Ignore keystrokes when typing inside text inputs
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (!settingsModal.classList.contains('hidden')) return;
+
+    switch (e.key) {
+      case 'ArrowUp':
+        e.preventDefault();
+        sendKey('UP');
+        break;
+      case 'ArrowDown':
+        e.preventDefault();
+        sendKey('DOWN');
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        sendKey('LEFT');
+        break;
+      case 'ArrowRight':
+        e.preventDefault();
+        sendKey('RIGHT');
+        break;
+      case 'Enter':
+      case ' ':
+        e.preventDefault();
+        sendKey('OK');
+        break;
+      case 'Escape':
+      case 'Backspace':
+        e.preventDefault();
+        sendKey('BACK');
+        break;
+      case 'h':
+      case 'H':
+        e.preventDefault();
+        sendKey('HOME');
+        break;
+      case 'm':
+      case 'M':
+        e.preventDefault();
+        sendKey('MENU');
+        break;
+      case '+':
+      case '=':
+        e.preventDefault();
+        sendKey('VOL_UP');
+        break;
+      case '-':
+      case '_':
+        e.preventDefault();
+        sendKey('VOL_DOWN');
+        break;
+    }
+  });
+}
+
+/* ========================================================================== */
+/* MOUSE TOUCHPAD & GESTURES                                                   */
+/* ========================================================================== */
+
 let lastTouchX = null;
 let lastTouchY = null;
 let touchStartTime = 0;
@@ -162,11 +489,10 @@ function initTouchpad() {
     }
   });
 
-  const handlePointerEnd = (e) => {
+  const handlePointerEnd = () => {
     touchpad.classList.remove('active');
     if (lastTouchX !== null) {
       const duration = Date.now() - touchStartTime;
-      // If it was a short tap without drag, trigger Left Click
       if (!touchMoved && duration < 280) {
         sendMouseClick('left');
       }
@@ -232,16 +558,16 @@ function sendScroll(step) {
   fetch(url, { method: 'POST', mode: 'cors' }).catch(() => {});
 }
 
-// Mouse Click Sender
 async function sendMouseClick(type = 'left') {
   vibrate(22);
   const url = `http://${tvIp}:${PORT}/mouse?click=${type}`;
-  try {
-    await fetch(url, { method: 'POST', mode: 'cors' });
-  } catch (e) {}
+  fetch(url, { method: 'POST', mode: 'cors' }).catch(() => {});
 }
 
-// Text Input Handler
+/* ========================================================================== */
+/* TEXT INJECTION & APP LAUNCHERS                                              */
+/* ========================================================================== */
+
 async function handleSendText(e) {
   e.preventDefault();
   const input = document.getElementById('keyboardInput');
@@ -253,22 +579,16 @@ async function handleSendText(e) {
   const url = `http://${tvIp}:${PORT}/text?text=${encodeURIComponent(text)}`;
   try {
     const res = await fetch(url, { method: 'POST', mode: 'cors' });
-    if (res.ok) {
-      input.value = '';
-    }
+    if (res.ok) input.value = '';
   } catch (err) {}
 }
 
-// App Launch Handler
 async function launchApp(pkg) {
   vibrate(25);
   const url = `http://${tvIp}:${PORT}/launch?pkg=${encodeURIComponent(pkg)}`;
-  try {
-    await fetch(url, { method: 'POST', mode: 'cors' });
-  } catch (err) {}
+  fetch(url, { method: 'POST', mode: 'cors' }).catch(() => {});
 }
 
-// Switch Mode
 function setMode(mode) {
   currentMode = mode;
   vibrate(12);
@@ -285,10 +605,14 @@ function setMode(mode) {
   }
 }
 
-// Modal handlers
+/* ========================================================================== */
+/* SETTINGS & AUTO-DISCOVERY                                                  */
+/* ========================================================================== */
+
 function openSettingsModal() {
   vibrate(10);
   if (tvIpInput) tvIpInput.value = tvIp;
+  updateDirectLinks();
   scanStatus.textContent = '';
   settingsModal.classList.remove('hidden');
 }
@@ -298,9 +622,7 @@ function closeSettingsModal() {
 }
 
 function closeModalOnOverlay(e) {
-  if (e.target === settingsModal) {
-    closeSettingsModal();
-  }
+  if (e.target === settingsModal) closeSettingsModal();
 }
 
 function saveTvIp() {
@@ -308,9 +630,11 @@ function saveTvIp() {
   if (val) {
     tvIp = val;
     localStorage.setItem('alveetv_ip', tvIp);
+    updateDirectLinks();
     vibrate(20);
     closeSettingsModal();
     checkConnection();
+    if (isStreaming) restartStream();
   }
 }
 
@@ -320,7 +644,7 @@ function toggleHaptics(e) {
   if (hapticEnabled) vibrate(30);
 }
 
-// Subnet Auto-Scanner: Scans local subnet if IP changes
+// Subnet Auto-Scanner
 let isScanning = false;
 async function startSubnetScan() {
   if (isScanning) return;
@@ -330,7 +654,6 @@ async function startSubnetScan() {
   statusText.textContent = 'Scanning...';
   scanStatus.textContent = 'Searching network for AlveeTV...';
 
-  // Determine base subnet from current IP (default to 192.168.0.)
   const ipParts = tvIp.split('.');
   const baseSubnet = (ipParts.length === 4) ? `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.` : '192.168.0.';
 
@@ -342,8 +665,7 @@ async function startSubnetScan() {
     const batch = [];
 
     for (let i = start; i < start + batchSize && i <= 254; i++) {
-      const targetIp = `${baseSubnet}${i}`;
-      batch.push(probeIp(targetIp));
+      batch.push(probeIp(`${baseSubnet}${i}`));
     }
 
     const results = await Promise.all(batch);
@@ -361,11 +683,13 @@ async function startSubnetScan() {
     tvIp = foundIp;
     localStorage.setItem('alveetv_ip', tvIp);
     if (tvIpInput) tvIpInput.value = tvIp;
+    updateDirectLinks();
     scanStatus.textContent = `Found AlveeTV at ${foundIp}!`;
     vibrate(50);
     setTimeout(() => {
       closeSettingsModal();
       checkConnection();
+      if (isStreaming) restartStream();
     }, 1200);
   } else {
     scanStatus.textContent = 'TV not found. Ensure TV & phone are on the same Wi-Fi.';
@@ -386,13 +710,10 @@ async function probeIp(ip) {
     clearTimeout(timeoutId);
     if (res.ok) {
       const data = await res.json();
-      if (data && data.app === 'AlveeTV') {
-        return ip;
-      }
+      if (data && data.app === 'AlveeTV') return ip;
     }
   } catch (e) {
     clearTimeout(timeoutId);
   }
   return null;
 }
-
