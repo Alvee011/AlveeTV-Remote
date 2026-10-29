@@ -76,7 +76,8 @@
           </div>
 
           <div class="canvas-container" id="canvasContainer">
-            <canvas id="liveCanvas" width="1280" height="720"></canvas>
+            <video id="liveVideo" autoplay playsinline muted></video>
+            <canvas id="liveCanvas" width="848" height="480" style="display:none;"></canvas>
             
             <!-- Touch / Click Target Layer -->
             <div class="screen-overlay" id="screenOverlay" onclick="handleScreenTap(event)" title="Click to touch TV screen">
@@ -306,6 +307,7 @@
     </div>
   </div>
 
+  <script src="jmuxer.min.js"></script>
   <script src="remote.js"></script>
 </body>
 </html>

@@ -169,8 +169,16 @@ async function sendKey(code) {
 }
 
 /* ========================================================================== */
-/* METHOD A: HARDWARE H.264 WEB STREAMING ENGINE (WebCodecs API)               */
+/* HARDWARE H.264 LIVE STREAM ENGINE (JMuxer MSE + WebCodecs)                  */
 /* ========================================================================== */
+
+// Ensure ManagedMediaSource is available as MediaSource on iOS 17.1+
+if (typeof window.MediaSource === 'undefined' && typeof window.ManagedMediaSource !== 'undefined') {
+  window.MediaSource = window.ManagedMediaSource;
+}
+
+let jmuxer = null;
+let latencyInterval = null;
 
 async function toggleLiveScreen() {
   if (isStreaming) {
@@ -184,140 +192,115 @@ async function startStream() {
   if (isStreaming) return;
   isStreaming = true;
 
+  const liveVideo = document.getElementById('liveVideo');
+  const liveCanvas = document.getElementById('liveCanvas');
+
   if (screenSection) screenSection.classList.remove('collapsed');
   if (btnLiveScreen) btnLiveScreen.classList.add('active');
   if (streamPlaceholder) streamPlaceholder.classList.add('hidden');
   if (tvPowerLed) tvPowerLed.className = 'power-led active';
 
   frameCount = 0;
+  if (fpsTimer) clearInterval(fpsTimer);
   fpsTimer = setInterval(() => {
     if (fpsBadge) fpsBadge.textContent = `${frameCount} FPS`;
     frameCount = 0;
   }, 1000);
 
-  const ctx = liveCanvas.getContext('2d');
-  timestampIndex = 0;
-
-  // Check if WebCodecs is supported
-  const hasWebCodecs = typeof VideoDecoder !== 'undefined';
-  if (!hasWebCodecs) {
-    console.warn('WebCodecs not supported in this browser; starting snapshot mode.');
-    runSnapshotFallback();
-    return;
-  }
-
-  streamAbortController = new AbortController();
   const streamUrl = `http://${tvIp}:${PORT}/stream.h264`;
+  streamAbortController = new AbortController();
 
-  try {
-    videoDecoder = new VideoDecoder({
-      output: (frame) => {
-        ctx.drawImage(frame, 0, 0, liveCanvas.width, liveCanvas.height);
-        frame.close();
-        frameCount++;
-      },
-      error: (e) => {
-        console.error('VideoDecoder error:', e);
+  // Primary Engine: JMuxer (MediaSource) - works in all browsers on HTTP LAN IP without security blocks
+  const hasMSE = (typeof window.MediaSource !== 'undefined');
+  if (hasMSE && typeof JMuxer !== 'undefined') {
+    if (liveVideo) {
+      liveVideo.style.display = 'block';
+      if (window.ManagedMediaSource) {
+        liveVideo.disableRemotePlayback = true;
       }
-    });
+    }
+    if (liveCanvas) liveCanvas.style.display = 'none';
 
-    const response = await fetch(streamUrl, {
-      signal: streamAbortController.signal,
-      mode: 'cors'
-    });
+    try {
+      if (jmuxer) {
+        try { jmuxer.destroy(); } catch (e) {}
+        jmuxer = null;
+      }
 
-    if (!response.body) throw new Error('No readable stream body');
+      jmuxer = new JMuxer({
+        node: 'liveVideo',
+        mode: 'video',
+        flushingTime: 0,
+        fps: 30,
+        clearBuffer: true,
+        debug: false,
+        onError: function(data) {
+          console.warn('JMuxer warning:', data);
+        }
+      });
 
-    const reader = response.body.getReader();
-    let buffer = new Uint8Array(0);
+      // Frame presentation tracking for real FPS
+      if (liveVideo && 'requestVideoFrameCallback' in liveVideo) {
+        const onFrame = () => {
+          if (!isStreaming) return;
+          frameCount++;
+          liveVideo.requestVideoFrameCallback(onFrame);
+        };
+        liveVideo.requestVideoFrameCallback(onFrame);
+      } else if (liveVideo) {
+        liveVideo.ontimeupdate = () => { frameCount++; };
+      }
 
-    while (isStreaming) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      // Append new chunk to buffer
-      const newBuf = new Uint8Array(buffer.length + value.length);
-      newBuf.set(buffer, 0);
-      newBuf.set(value, buffer.length);
-      buffer = newBuf;
-
-      // Parse Annex B NAL units (0x00 0x00 0x00 0x01 or 0x00 0x00 0x01)
-      let nalStart = -1;
-      let i = 0;
-
-      while (i < buffer.length - 4) {
-        if (buffer[i] === 0 && buffer[i+1] === 0 && (buffer[i+2] === 1 || (buffer[i+2] === 0 && buffer[i+3] === 1))) {
-          const prefixLen = buffer[i+2] === 1 ? 3 : 4;
-          if (nalStart >= 0) {
-            const nalData = buffer.slice(nalStart, i);
-            processNalUnit(nalData);
+      // Latency control: keep video locked to live edge with sub-100ms latency
+      if (latencyInterval) clearInterval(latencyInterval);
+      latencyInterval = setInterval(() => {
+        if (!isStreaming || !liveVideo) {
+          clearInterval(latencyInterval);
+          return;
+        }
+        if (liveVideo.buffered && liveVideo.buffered.length > 0) {
+          const end = liveVideo.buffered.end(liveVideo.buffered.length - 1);
+          if (end - liveVideo.currentTime > 0.35) {
+            liveVideo.currentTime = end - 0.05;
           }
-          nalStart = i + prefixLen;
-          i += prefixLen;
-        } else {
-          i++;
+        }
+      }, 500);
+
+      const response = await fetch(streamUrl, {
+        signal: streamAbortController.signal,
+        mode: 'cors'
+      });
+
+      if (!response.body) throw new Error('No readable stream body');
+      const reader = response.body.getReader();
+
+      while (isStreaming) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (jmuxer && value && value.length > 0) {
+          jmuxer.feed({ video: value });
         }
       }
-
-      // Retain remainder
-      if (nalStart >= 0) {
-        buffer = buffer.slice(nalStart);
+      return;
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.warn('JMuxer stream stopped:', err);
       }
+      stopStream();
+      return;
     }
-  } catch (err) {
-    if (err.name !== 'AbortError') {
-      console.warn('H.264 stream disconnected:', err);
-    }
-    stopStream();
-  }
-}
-
-function processNalUnit(nal) {
-  if (!nal || nal.length === 0 || !videoDecoder) return;
-
-  const nalType = nal[0] & 0x1F;
-
-  // SPS (Type 7)
-  if (nalType === 7) {
-    spsData = nal;
-    return;
-  }
-
-  // PPS (Type 8)
-  if (nalType === 8) {
-    ppsData = nal;
-    if (spsData && videoDecoder.state === 'unconfigured') {
-      try {
-        videoDecoder.configure({
-          codec: 'avc1.42001f', // Baseline 720p
-          optimizeForLatency: true
-        });
-      } catch (e) {
-        console.error('Decoder configure error:', e);
-      }
-    }
-    return;
-  }
-
-  // IDR Keyframe (Type 5) or Delta frame (Type 1)
-  if (videoDecoder.state === 'configured') {
-    const isKey = (nalType === 5);
-    try {
-      const chunk = new EncodedVideoChunk({
-        type: isKey ? 'key' : 'delta',
-        timestamp: (timestampIndex++) * 16666, // ~60fps ticks
-        data: nal
-      });
-      videoDecoder.decode(chunk);
-    } catch (e) {}
   }
 }
 
 function stopStream() {
   isStreaming = false;
   if (streamAbortController) {
-    streamAbortController.abort();
+    try { streamAbortController.abort(); } catch (e) {}
     streamAbortController = null;
+  }
+  if (jmuxer) {
+    try { jmuxer.destroy(); } catch (e) {}
+    jmuxer = null;
   }
   if (videoDecoder) {
     try { videoDecoder.close(); } catch (e) {}
@@ -327,10 +310,23 @@ function stopStream() {
     clearInterval(fpsTimer);
     fpsTimer = null;
   }
+  if (latencyInterval) {
+    clearInterval(latencyInterval);
+    latencyInterval = null;
+  }
   if (fpsBadge) fpsBadge.textContent = '0 FPS';
   if (btnLiveScreen) btnLiveScreen.classList.remove('active');
   if (streamPlaceholder) streamPlaceholder.classList.remove('hidden');
   if (tvPowerLed) tvPowerLed.className = 'power-led';
+
+  const liveVideo = document.getElementById('liveVideo');
+  if (liveVideo) {
+    try {
+      liveVideo.pause();
+      liveVideo.removeAttribute('src');
+      liveVideo.load();
+    } catch (e) {}
+  }
 }
 
 function restartStream() {
@@ -338,29 +334,18 @@ function restartStream() {
   setTimeout(startStream, 300);
 }
 
-// Fallback snapshot loop
-async function runSnapshotFallback() {
-  const ctx = liveCanvas.getContext('2d');
-  const img = new Image();
-  img.onload = () => {
-    ctx.drawImage(img, 0, 0, liveCanvas.width, liveCanvas.height);
-    frameCount++;
-    if (isStreaming) {
-      setTimeout(() => { img.src = `http://${tvIp}:${PORT}/ping?t=${Date.now()}`; }, 100);
-    }
-  };
-}
-
-// Tap directly on TV screen canvas
+// Tap directly on TV screen canvas / video
 function handleScreenTap(e) {
-  const rect = liveCanvas.getBoundingClientRect();
+  const container = document.getElementById('canvasContainer') || document.getElementById('liveVideo');
+  const rect = container.getBoundingClientRect();
   const clickX = e.clientX - rect.left;
   const clickY = e.clientY - rect.top;
 
-  const tvX = Math.round((clickX / rect.width) * 1280);
-  const tvY = Math.round((clickY / rect.height) * 720);
+  // TV physical screen resolution is 1920x1080
+  const tvX = Math.round((clickX / rect.width) * 1920);
+  const tvY = Math.round((clickY / rect.height) * 1080);
 
-  // Animate ripple
+  // Animate ripple feedback
   if (tapRipple) {
     tapRipple.style.left = `${clickX}px`;
     tapRipple.style.top = `${clickY}px`;
@@ -369,9 +354,9 @@ function handleScreenTap(e) {
     tapRipple.classList.add('animate');
   }
 
-  vibrate(20);
+  vibrate(12);
   const url = `http://${tvIp}:${PORT}/tap?x=${tvX}&y=${tvY}`;
-  fetch(url, { method: 'POST', mode: 'cors' }).catch(() => {});
+  fetch(url, { method: 'POST', mode: 'no-cors' }).catch(() => {});
 }
 
 function toggleFullscreen() {
