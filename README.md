@@ -107,7 +107,11 @@ Supported shortcuts can include:
 
 These are shortcuts to applications available on your TV. AlveeTV Remote does not install or bundle these applications.
 
-### 6. Automatic TV Discovery
+### 6. One-Tap Recent Apps & RAM Cleaner
+
+Dedicated red action button to instantly close all running background activity stacks, purge cached processes, and free up TV box RAM in < 200ms.
+
+### 7. Automatic TV Discovery
 
 Your router may assign a different IP address to your TV box after restarting.
 
@@ -117,7 +121,7 @@ Alternatively, enter the TV box's current IP address manually.
 
 Once discovered, the remote can reconnect using the TV's port 8080.
 
-### 7. Desktop Keyboard Shortcuts
+### 8. Desktop Keyboard Shortcuts
 
 Control your TV from a computer using your physical keyboard.
 

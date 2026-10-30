@@ -213,6 +213,9 @@ async function startStream() {
   // Primary Engine: JMuxer (MediaSource) - works in all browsers on HTTP LAN IP without security blocks
   const hasMSE = (typeof window.MediaSource !== 'undefined');
   if (hasMSE && typeof JMuxer !== 'undefined') {
+    // Disable JMuxer's built-in destructive cancelDelay seeking which freezes H.264 decoders
+    JMuxer.prototype.cancelDelay = function() {};
+
     if (liveVideo) {
       liveVideo.style.display = 'block';
       if (window.ManagedMediaSource) {
@@ -227,31 +230,64 @@ async function startStream() {
         jmuxer = null;
       }
 
-      jmuxer = new JMuxer({
-        node: 'liveVideo',
-        mode: 'video',
-        flushingTime: 0,
-        fps: 30,
-        clearBuffer: true,
-        debug: false,
-        onError: function(data) {
-          console.warn('JMuxer warning:', data);
-        }
+      // Wait for MediaSource sourceopen to fire before fetching H.264 stream
+      // This ensures the first SPS/PPS NAL packet is never dropped
+      await new Promise((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => {
+          if (!done) { done = true; resolve(); }
+        }, 400);
+
+        jmuxer = new JMuxer({
+          node: 'liveVideo',
+          mode: 'video',
+          flushingTime: 0,
+          fps: 30,
+          clearBuffer: true,
+          debug: false,
+          onReady: function() {
+            if (!done) { done = true; clearTimeout(timer); resolve(); }
+          },
+          onError: function(data) {
+            console.warn('JMuxer warning:', data);
+          }
+        });
       });
 
-      // Frame presentation tracking for real FPS
-      if (liveVideo && 'requestVideoFrameCallback' in liveVideo) {
-        const onFrame = () => {
-          if (!isStreaming) return;
-          frameCount++;
-          liveVideo.requestVideoFrameCallback(onFrame);
+      if (!isStreaming) return;
+
+      // Auto-play when ready
+      const tryPlay = () => {
+        if (liveVideo && liveVideo.paused && isStreaming) {
+          liveVideo.play().catch(() => {});
+        }
+      };
+      if (liveVideo) {
+        liveVideo.onloadedmetadata = tryPlay;
+        liveVideo.oncanplay = tryPlay;
+        liveVideo.onplay = () => {
+          if (streamPlaceholder) streamPlaceholder.classList.add('hidden');
         };
-        liveVideo.requestVideoFrameCallback(onFrame);
-      } else if (liveVideo) {
-        liveVideo.ontimeupdate = () => { frameCount++; };
       }
 
-      // Latency control: keep video locked to live edge with sub-100ms latency
+      // Frame presentation tracking for real FPS
+      if (liveVideo) {
+        if ('requestVideoFrameCallback' in liveVideo) {
+          const onFrame = () => {
+            if (!isStreaming) return;
+            frameCount++;
+            liveVideo.requestVideoFrameCallback(onFrame);
+          };
+          liveVideo.requestVideoFrameCallback(onFrame);
+        }
+        liveVideo.ontimeupdate = () => {
+          if (isStreaming && !liveVideo.paused) {
+            frameCount++;
+          }
+        };
+      }
+
+      // Latency synchronization via dynamic playbackRate catch-up (zero stutter, zero decoder seek stalls)
       if (latencyInterval) clearInterval(latencyInterval);
       latencyInterval = setInterval(() => {
         if (!isStreaming || !liveVideo) {
@@ -260,11 +296,21 @@ async function startStream() {
         }
         if (liveVideo.buffered && liveVideo.buffered.length > 0) {
           const end = liveVideo.buffered.end(liveVideo.buffered.length - 1);
-          if (end - liveVideo.currentTime > 0.35) {
-            liveVideo.currentTime = end - 0.05;
+          const drift = end - liveVideo.currentTime;
+
+          if (liveVideo.paused && liveVideo.readyState >= 2) {
+            liveVideo.play().catch(() => {});
+          }
+
+          if (drift > 1.2) {
+            liveVideo.playbackRate = 1.25;
+          } else if (drift > 0.4) {
+            liveVideo.playbackRate = 1.08;
+          } else if (drift < 0.15) {
+            liveVideo.playbackRate = 1.0;
           }
         }
-      }, 500);
+      }, 300);
 
       const response = await fetch(streamUrl, {
         signal: streamAbortController.signal,
@@ -279,6 +325,12 @@ async function startStream() {
         if (done) break;
         if (jmuxer && value && value.length > 0) {
           jmuxer.feed({ video: value });
+          if (liveVideo && liveVideo.paused && liveVideo.readyState >= 2) {
+            liveVideo.play().catch(() => {});
+          }
+          if (frameCount === 0 && liveVideo && !liveVideo.paused && liveVideo.currentTime > 0) {
+            frameCount++;
+          }
         }
       }
       return;
@@ -322,6 +374,7 @@ function stopStream() {
   const liveVideo = document.getElementById('liveVideo');
   if (liveVideo) {
     try {
+      liveVideo.playbackRate = 1.0;
       liveVideo.pause();
       liveVideo.removeAttribute('src');
       liveVideo.load();
@@ -572,6 +625,47 @@ async function launchApp(pkg) {
   vibrate(25);
   const url = `http://${tvIp}:${PORT}/launch?pkg=${encodeURIComponent(pkg)}`;
   fetch(url, { method: 'POST', mode: 'cors' }).catch(() => {});
+}
+
+async function clearRecentApps() {
+  vibrate(35);
+  const btn = document.querySelector('.btn-clear-recents');
+  if (btn) {
+    btn.classList.add('clearing');
+    const originalContent = btn.innerHTML;
+    btn.innerHTML = `
+      <svg class="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10" stroke-dasharray="32" stroke-linecap="round"/>
+      </svg>
+      <span>Clearing Recent Apps...</span>
+    `;
+
+    setTimeout(() => {
+      btn.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+        <span style="color:#4ade80;">Cleared & Freed!</span>
+      `;
+      setTimeout(() => {
+        btn.classList.remove('clearing');
+        btn.innerHTML = originalContent;
+      }, 1600);
+    }, 600);
+  }
+
+  // 1. Try dedicated /clear_recents endpoint
+  try {
+    const res = await fetch(`http://${tvIp}:${PORT}/clear_recents`, { method: 'POST', mode: 'cors' });
+    if (res.ok) return;
+  } catch (e) {}
+
+  // 2. High-compatibility fallback pipeline: removes background stacks, kills cached tasks & returns to Home
+  try {
+    const cmd = ';for s in $(am stack list | grep -o \'Stack id=[1-9][0-9]*\' | cut -d= -f2); do am stack remove $s 2>/dev/null; done; am kill-all; input keyevent 3';
+    const fallbackUrl = `http://${tvIp}:${PORT}/launch?pkg=${encodeURIComponent(cmd)}`;
+    await fetch(fallbackUrl, { method: 'POST', mode: 'cors' });
+  } catch (err) {}
 }
 
 function setMode(mode) {
